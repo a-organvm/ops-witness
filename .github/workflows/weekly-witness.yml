@@ -1,0 +1,138 @@
+name: weekly-witness
+
+# Cross-plane witness — reconcile the planes' bookends against what should have run.
+#
+# Reads (a) this repo's audit/ directory and (b) the ops repo's bookends/ via REST (public),
+# then flags any of the last 7 days where org-hygiene-report has no paired bookend
+# (a `start` and a matching `end`). Writes audit/YYYY-MM-DD-witness.md and commits it.
+#
+# A silent gap is a failure, not a non-event: both "never fired" (no lines) and "fired but
+# died" (start with no end) are flagged.
+#
+# Stagger rule: never `0 * * * *`. Runs Sundays 12:49 UTC.
+
+on:
+  schedule:
+    - cron: '49 12 * * 0'   # Sundays 12:49 UTC — staggered, off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # to commit the witness report
+
+concurrency:
+  group: weekly-witness
+  cancel-in-progress: false
+
+env:
+  OPS_REPO: a-organvm/ops
+  WATCHED_JOB: org-hygiene-report
+
+jobs:
+  witness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconcile ops bookends and write witness report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DAY="$(date -u +%Y-%m-%d)"
+          mkdir -p audit
+          REPORT="audit/${DAY}-witness.md"
+          WORK="$(mktemp -d)"
+
+          # ---- (a) read this repo's own audit/ record (presence inventory) ----
+          LOCAL_AUDIT_COUNT="$(ls -1 audit/*.md 2>/dev/null | wc -l | tr -d ' ')"
+
+          # ---- (b) pull ops repo's bookends/ listing via REST (public, no extra token) ----
+          # Returns each file's name; we fetch the ones for the last 7 days.
+          BOOKEND_LIST="$(gh api "repos/${OPS_REPO}/contents/bookends" --jq '.[].name' 2>/dev/null || echo "")"
+
+          {
+            echo "# Cross-plane witness — ${DAY}"
+            echo ""
+            echo "_Generated ${DAY} $(date -u +%H:%M:%SZ) by the witness plane._"
+            echo ""
+            echo "- Watched plane: \`${OPS_REPO}\` (plane i)"
+            echo "- Watched job: \`${WATCHED_JOB}\`"
+            echo "- Local audit reports on file: ${LOCAL_AUDIT_COUNT}"
+            echo ""
+            echo "## Last 7 days — bookend pairing"
+            echo ""
+            echo "| Day | start | end | verdict |"
+            echo "|-----|:-----:|:---:|---------|"
+          } > "$REPORT"
+
+          FLAGGED=0
+
+          for i in $(seq 0 6); do
+            D="$(date -u -d "-${i} day" +%Y-%m-%d)"
+            FNAME="${D}.tsv"
+
+            if echo "$BOOKEND_LIST" | grep -qx "$FNAME"; then
+              # Fetch the day's TSV content (base64 via contents API) and grep our job.
+              gh api "repos/${OPS_REPO}/contents/bookends/${FNAME}" --jq '.content' 2>/dev/null \
+                | base64 -d > "${WORK}/${FNAME}" 2>/dev/null || true
+
+              HAS_START="$(awk -F'\t' -v j="$WATCHED_JOB" '$2==j && $5=="start"{c++} END{print c+0}' "${WORK}/${FNAME}" 2>/dev/null || echo 0)"
+              HAS_END="$(awk -F'\t' -v j="$WATCHED_JOB" '$2==j && $5=="end"{c++} END{print c+0}' "${WORK}/${FNAME}" 2>/dev/null || echo 0)"
+
+              if [ "$HAS_START" -gt 0 ] && [ "$HAS_END" -gt 0 ]; then
+                VERDICT="healthy"
+                SMARK="yes"; EMARK="yes"
+              elif [ "$HAS_START" -gt 0 ] && [ "$HAS_END" -eq 0 ]; then
+                VERDICT="**FLAG: fired but no end (died mid-run)**"
+                SMARK="yes"; EMARK="no"
+                FLAGGED=$((FLAGGED + 1))
+              else
+                VERDICT="**FLAG: no ${WATCHED_JOB} bookend on a day with a TSV**"
+                SMARK="no"; EMARK="no"
+                FLAGGED=$((FLAGGED + 1))
+              fi
+            else
+              # No TSV file for that day at all.
+              VERDICT="**FLAG: no bookend file (job never fired?)**"
+              SMARK="no"; EMARK="no"
+              FLAGGED=$((FLAGGED + 1))
+            fi
+
+            echo "| ${D} | ${SMARK} | ${EMARK} | ${VERDICT} |" >> "$REPORT"
+          done
+
+          {
+            echo ""
+            echo "## Summary"
+            echo ""
+            if [ "$FLAGGED" -eq 0 ]; then
+              echo "All 7 days have paired \`${WATCHED_JOB}\` bookends. No gaps. **Healthy.**"
+            else
+              echo "**${FLAGGED}** day(s) flagged over the last 7. A silent gap is a failure,"
+              echo "not a non-event — investigate the flagged days above."
+            fi
+            echo ""
+            echo "_Note: a newly stood-up backbone will show flags for days predating its"
+            echo "first fire. That is correct — those days genuinely had no run._"
+          } >> "$REPORT"
+
+          echo "Wrote ${REPORT} (flagged=${FLAGGED})"
+
+      - name: Commit witness report [skip ci]
+        if: always()
+        run: |
+          set -euo pipefail
+          DAY="$(date -u +%Y-%m-%d)"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add audit/ || true
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "witness: ${DAY} cross-plane reconciliation [skip ci]"
+            git pull --rebase --autostash origin "$(git rev-parse --abbrev-ref HEAD)" || true
+            git push
+          fi
